@@ -8,7 +8,7 @@ A disposable KVM-backed VM sandbox for safely executing untrusted or dangerous s
 
 I teach operating systems. My students write code that calls `fork()`, mmap shared memory, and wrestle with semaphores — exactly the low-level primitives that make an OS tick, and exactly the ones that can make a host machine stop ticking when they go wrong.
 
-After grading a few rounds of [CECS 326 Lab 2 (Semaphores)](https://github.com/agiacalone/cecs-326-lab-semaphores-revamp) on bare metal, I had been fork-bombed enough times to know that hope is not a grading strategy. A student's well-intentioned-but-slightly-wrong loop would eat the process table, the machine would crawl, and I would be staring at an unresponsive terminal wondering why I didn't just become an accountant. By the third time, I stopped running student code on anything I cared about.
+After grading a few rounds of the predecessor to my current lab [CECS 326 Lab 2 (Semaphores)](https://github.com/agiacalone/cecs-326-lab-semaphores-revamp) on bare metal, I had been fork-bombed enough times to know that running poorly-tested systemcalls on my laptop directly is a really bad idea. A student's well-intentioned-but-slightly-wrong loop would eat the process table, the machine would crawl, and I would be staring at an unresponsive terminal wondering why I left the field of accounting (I hated it). By the third full reboot during a single grading session, the lesson sunk in.
 
 ---
 
