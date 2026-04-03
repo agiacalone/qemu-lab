@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# If running inside a Distrobox container, re-exec this script on the host
+if [[ -f /run/.containerenv ]] || [[ -n "${CONTAINER_ID:-}" ]]; then
+    exec distrobox-host-exec "$0" "$@"
+fi
+
+STORE_DIR="${HOME}/.local/share/fedora-sandbox"
+BASE_IMAGE="${STORE_DIR}/base.qcow2"
+LAX_IMAGE="${STORE_DIR}/lax.qcow2"
+SEED_ISO="${STORE_DIR}/seed.iso"
+
+VM_CPUS="${SANDBOX_CPUS:-2}"
+VM_RAM="${SANDBOX_RAM:-2G}"
+
+MODE="sandbox"
+DO_RESET=false
+DO_UPDATE=false
+EXPLICIT_LAUNCH=false
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  --sandbox       Full sandbox: no network, disposable VM (default)
+  --lax           NAT network, persistent disk (~/.local/share/fedora-sandbox/lax.qcow2)
+  --reset         With --lax: wipe persistent overlay and start fresh
+  --update-image  Download latest Fedora Cloud image; exit unless --sandbox/--lax also passed
+  --help          Show this help
+
+Environment:
+  SANDBOX_CPUS    vCPU count (default: 2)
+  SANDBOX_RAM     RAM allocation (default: 2G)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sandbox)      MODE="sandbox"; EXPLICIT_LAUNCH=true ;;
+        --lax)          MODE="lax";     EXPLICIT_LAUNCH=true ;;
+        --reset)        DO_RESET=true ;;
+        --update-image) DO_UPDATE=true ;;
+        --help|-h)      usage; exit 0 ;;
+        *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+done
+
+mkdir -p "${STORE_DIR}"
+
+# ---------------------------------------------------------------------------
+# cloud-init seed ISO — provides login credentials on first boot
+# ---------------------------------------------------------------------------
+create_seed_iso() {
+    echo "Creating cloud-init seed ISO..."
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf ${tmpdir}" RETURN
+
+    cat > "${tmpdir}/meta-data" <<'EOF'
+instance-id: fedora-sandbox
+local-hostname: sandbox
+EOF
+
+    cat > "${tmpdir}/user-data" <<'EOF'
+#cloud-config
+users:
+  - name: fedora
+    plain_text_passwd: sandbox
+    lock_passwd: false
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+runcmd:
+  - systemctl disable --now cloud-init cloud-init-local cloud-config cloud-final 2>/dev/null || true
+EOF
+
+    if command -v xorriso &>/dev/null; then
+        xorriso -as mkisofs -output "${SEED_ISO}" \
+            -volid cidata -joliet -rock \
+            "${tmpdir}/user-data" "${tmpdir}/meta-data" 2>/dev/null
+    elif command -v genisoimage &>/dev/null; then
+        genisoimage -output "${SEED_ISO}" \
+            -volid cidata -joliet -rock \
+            "${tmpdir}/user-data" "${tmpdir}/meta-data"
+    else
+        echo "Error: xorriso or genisoimage required — install one to generate the cloud-init seed"
+        exit 1
+    fi
+
+    echo "Seed ISO created."
+}
+
+# ---------------------------------------------------------------------------
+# Download latest Fedora Cloud qcow2, verify SHA256
+# ---------------------------------------------------------------------------
+update_image() {
+    command -v curl     &>/dev/null || { echo "Error: curl is required";      exit 1; }
+    command -v sha256sum &>/dev/null || { echo "Error: sha256sum is required"; exit 1; }
+
+    local releases_url="https://dl.fedoraproject.org/pub/fedora/linux/releases/"
+
+    echo "Fetching latest Fedora Cloud release..."
+    local latest_version
+    latest_version=$(curl -s "${releases_url}" \
+        | grep -oP '(?<=href=")[0-9]+(?=/)' \
+        | sort -n | tail -1)
+    [[ -n "${latest_version}" ]] || { echo "Error: could not determine latest Fedora version"; exit 1; }
+    echo "Latest version: Fedora ${latest_version}"
+
+    local images_url="${releases_url}${latest_version}/Cloud/x86_64/images/"
+    local image_filename
+    image_filename=$(curl -s "${images_url}" \
+        | grep -oP 'Fedora-Cloud-Base-Generic[^"]+\.qcow2' \
+        | head -1)
+    [[ -n "${image_filename}" ]] || { echo "Error: no Cloud qcow2 found for Fedora ${latest_version}"; exit 1; }
+
+    local image_url="${images_url}${image_filename}"
+    local checksum_filename
+    checksum_filename=$(curl -s "${images_url}" \
+        | grep -oP 'Fedora-Cloud-[^"]+CHECKSUM' \
+        | head -1)
+    [[ -n "${checksum_filename}" ]] || { echo "Error: no CHECKSUM file found for Fedora ${latest_version}"; exit 1; }
+    local checksum_url="${images_url}${checksum_filename}"
+
+    echo "Downloading ${image_filename}..."
+    curl -L --progress-bar -o "${BASE_IMAGE}.tmp" "${image_url}"
+
+    echo "Verifying SHA256..."
+    local checksum_data expected_sha256 actual_sha256
+    checksum_data=$(curl -s "${checksum_url}")
+    expected_sha256=$(echo "${checksum_data}" \
+        | grep "SHA256 (${image_filename})" \
+        | grep -oP '(?<= = )[a-f0-9]+' || true)
+
+    if [[ -n "${expected_sha256}" ]]; then
+        actual_sha256=$(sha256sum "${BASE_IMAGE}.tmp" | awk '{print $1}')
+        if [[ "${expected_sha256}" != "${actual_sha256}" ]]; then
+            echo "Error: SHA256 mismatch — removing download"
+            rm -f "${BASE_IMAGE}.tmp"
+            exit 1
+        fi
+        echo "Checksum OK."
+    else
+        echo "Warning: could not retrieve expected checksum — skipping verification"
+    fi
+
+    mv "${BASE_IMAGE}.tmp" "${BASE_IMAGE}"
+
+    # Stale overlays are now invalid — remove them
+    if [[ -f "${LAX_IMAGE}" ]]; then
+        echo "Base image updated — removing stale lax overlay."
+        rm -f "${LAX_IMAGE}"
+    fi
+    rm -f "${SEED_ISO}"
+
+    echo "Base image saved to ${BASE_IMAGE}"
+}
+
+# ---------------------------------------------------------------------------
+# Launch the VM
+# ---------------------------------------------------------------------------
+launch_vm() {
+    command -v qemu-system-x86_64 &>/dev/null || { echo "Error: qemu-system-x86_64 not found"; exit 1; }
+    command -v qemu-img           &>/dev/null || { echo "Error: qemu-img not found";            exit 1; }
+
+    [[ -f "${BASE_IMAGE}" ]] || { echo "No base image found. Run: $(basename "$0") --update-image"; exit 1; }
+    [[ -f "${SEED_ISO}" ]]   || create_seed_iso
+
+    local overlay network_args
+
+    if [[ "${MODE}" == "sandbox" ]]; then
+        overlay=$(mktemp -u "${STORE_DIR}/sandbox-XXXXXX.qcow2")
+        qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE}" "${overlay}"
+        network_args="-nic none"
+        # shellcheck disable=SC2064
+        trap "rm -f ${overlay}" EXIT
+        echo "Mode : FULL SANDBOX — no network, disposable"
+        echo "Note : cloud-init network detection may add ~60s to first boot"
+    else
+        if ${DO_RESET} && [[ -f "${LAX_IMAGE}" ]]; then
+            echo "Resetting lax overlay..."
+            rm -f "${LAX_IMAGE}"
+        fi
+        overlay="${LAX_IMAGE}"
+        network_args="-nic user,model=virtio"
+        if [[ ! -f "${overlay}" ]]; then
+            qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE}" "${overlay}"
+        fi
+        echo "Mode : LAX — NAT network, persistent overlay"
+        echo "Disk : ${overlay}"
+    fi
+
+    echo ""
+    echo "Login : fedora / sandbox"
+    echo "Exit  : Ctrl-A X"
+    echo ""
+
+    qemu-system-x86_64 \
+        -enable-kvm \
+        -m "${VM_RAM}" \
+        -smp "${VM_CPUS}" \
+        -drive file="${overlay}",format=qcow2,if=virtio \
+        -drive file="${SEED_ISO}",format=raw,if=virtio,readonly=on \
+        ${network_args} \
+        -nographic \
+        -serial mon:stdio
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if ${DO_UPDATE}; then
+    update_image
+fi
+
+if ! ${DO_UPDATE} || ${EXPLICIT_LAUNCH}; then
+    launch_vm
+fi

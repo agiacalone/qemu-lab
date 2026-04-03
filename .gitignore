@@ -1,0 +1,21 @@
+# Claude Code
+CLAUDE.md
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+__MACOSX/
+
+# Linux
+*~
+.fuse_hidden*
+.Trash-*
+.nfs*
+
+# Editor artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
