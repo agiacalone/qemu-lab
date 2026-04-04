@@ -9,11 +9,13 @@ fi
 STORE_DIR="${HOME}/.local/share/fedora-sandbox"
 BASE_IMAGE="${STORE_DIR}/base.qcow2"
 LAX_IMAGE="${STORE_DIR}/lax.qcow2"
-SEED_ISO="${STORE_DIR}/seed.iso"
+SANDBOX_SEED="${STORE_DIR}/sandbox-seed.iso"
+LAX_SEED="${STORE_DIR}/lax-seed.iso"
 
 # Support both old (SANDBOX_*) and new (FEDORA_SANDBOX_*) env var names
 VM_CPUS="${FEDORA_SANDBOX_CPUS:-${SANDBOX_CPUS:-2}}"
 VM_RAM="${FEDORA_SANDBOX_RAM:-${SANDBOX_RAM:-2G}}"
+SSH_PORT=2222
 
 VERSION="1.0"
 MODE="sandbox"
@@ -27,8 +29,8 @@ Usage: $(basename "$0") [OPTION]...
 
 Create and launch a disposable or persistent Fedora Cloud VM via QEMU/KVM.
 
-  --sandbox         full sandbox: no network, disposable VM (default)
-  --lax             NAT network, persistent disk
+  --sandbox         full sandbox: network disabled at boot, disposable VM (default)
+  --lax             network enabled at boot, persistent disk
   --reset           with --lax: wipe persistent overlay and start fresh
   --update-image    download latest Fedora Cloud image and remove stale
                     overlays; exit unless --sandbox or --lax is also passed
@@ -38,6 +40,9 @@ Create and launch a disposable or persistent Fedora Cloud VM via QEMU/KVM.
 Environment:
   FEDORA_SANDBOX_CPUS    vCPU count (default: 2)
   FEDORA_SANDBOX_RAM     RAM allocation (default: 2G)
+
+SSH access (both modes): ssh -p ${SSH_PORT} fedora@localhost  (password: sandbox)
+Network control (in VM): sudo sandbox-net {enable|disable|status}
 
 Persistent overlay: ${LAX_IMAGE}
 
@@ -72,10 +77,13 @@ fi
 mkdir -p "${STORE_DIR}"
 
 # ---------------------------------------------------------------------------
-# cloud-init seed ISO — provides login credentials on first boot
+# cloud-init seed ISO — provides login credentials and first-boot config
 # ---------------------------------------------------------------------------
 create_seed_iso() {
-    echo "fedora-sandbox: creating cloud-init seed ISO..." >&2
+    local dest="$1"
+    local mode="$2"
+
+    echo "fedora-sandbox: creating ${mode} cloud-init seed ISO..." >&2
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -87,7 +95,8 @@ instance-id: fedora-sandbox
 local-hostname: sandbox
 EOF
 
-    cat > "${tmpdir}/user-data" <<'EOF'
+    if [[ "${mode}" == "sandbox" ]]; then
+        cat > "${tmpdir}/user-data" <<'EOF'
 #cloud-config
 users:
   - name: fedora
@@ -95,16 +104,80 @@ users:
     lock_passwd: false
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
+ssh_pwauth: true
+write_files:
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    permissions: '0644'
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin fedora --keep-baud 115200,57600,38400,9600 %I $TERM
+  - path: /etc/motd
+    permissions: '0644'
+    content: |
+      ┌─ SANDBOX MODE ──────────────────────────────────┐
+      │  Network is DISABLED. Outbound traffic blocked.  │
+      └──────────────────────────────────────────────────┘
+
+      Network control:
+        sudo sandbox-net enable   — allow outbound traffic
+        sudo sandbox-net disable  — block outbound traffic
+        sudo sandbox-net status   — show current state
+
+      File transfer (from host):
+        scp -P 2222 <file> fedora@localhost:~
+
 runcmd:
+  - systemctl daemon-reload
+  - systemctl restart serial-getty@ttyS0.service
+  - /usr/local/bin/sandbox-net disable
   - systemctl disable --now cloud-init cloud-init-local cloud-config cloud-final 2>/dev/null || true
 EOF
+    else
+        cat > "${tmpdir}/user-data" <<'EOF'
+#cloud-config
+users:
+  - name: fedora
+    plain_text_passwd: sandbox
+    lock_passwd: false
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+ssh_pwauth: true
+write_files:
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    permissions: '0644'
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin fedora --keep-baud 115200,57600,38400,9600 %I $TERM
+  - path: /etc/motd
+    permissions: '0644'
+    content: |
+      ┌─ LAX MODE ─────────────────────────────────────┐
+      │  Network is ENABLED. NAT via QEMU user-mode.   │
+      └─────────────────────────────────────────────────┘
+
+      Network control:
+        sudo sandbox-net enable   — allow outbound traffic
+        sudo sandbox-net disable  — block outbound traffic
+        sudo sandbox-net status   — show current state
+
+      File transfer (from host):
+        scp -P 2222 <file> fedora@localhost:~
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl restart serial-getty@ttyS0.service
+  - systemctl disable --now cloud-init cloud-init-local cloud-config cloud-final 2>/dev/null || true
+EOF
+    fi
 
     if command -v xorriso &>/dev/null; then
-        xorriso -as mkisofs -output "${SEED_ISO}" \
+        xorriso -as mkisofs -output "${dest}" \
             -volid cidata -joliet -rock \
             "${tmpdir}/user-data" "${tmpdir}/meta-data" 2>/dev/null
     elif command -v genisoimage &>/dev/null; then
-        genisoimage -output "${SEED_ISO}" \
+        genisoimage -output "${dest}" \
             -volid cidata -joliet -rock \
             "${tmpdir}/user-data" "${tmpdir}/meta-data"
     else
@@ -116,7 +189,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Download latest Fedora Cloud qcow2, verify SHA256
+# Download latest Fedora Cloud qcow2, verify SHA256, install tools
 # ---------------------------------------------------------------------------
 update_image() {
     command -v curl      &>/dev/null || { echo "fedora-sandbox: curl is required" >&2;      exit 1; }
@@ -171,17 +244,80 @@ update_image() {
 
     mv "${BASE_IMAGE}.tmp" "${BASE_IMAGE}"
 
-    echo "fedora-sandbox: installing development tools into base image..." >&2
+    # Write sandbox-net to a tempfile for upload into the image
+    local net_script
+    net_script=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f ${net_script}" RETURN
+    cat > "${net_script}" <<'NETSCRIPT'
+#!/bin/bash
+# sandbox-net — toggle outbound network access inside the sandbox VM
+set -euo pipefail
+PROG=$(basename "$0")
+TABLE=sandbox_net
+VERSION=1.0
+
+[ "$(id -u)" -eq 0 ] || { echo "${PROG}: must be run as root" >&2; exit 1; }
+
+case "${1:-}" in
+    enable)
+        nft delete table inet "${TABLE}" 2>/dev/null || true
+        echo "${PROG}: network enabled" >&2
+        ;;
+    disable)
+        nft delete table inet "${TABLE}" 2>/dev/null || true
+        nft add table inet "${TABLE}"
+        nft add chain inet "${TABLE}" output \
+            '{ type filter hook output priority 100; policy drop; }'
+        nft add rule inet "${TABLE}" output oifname lo accept
+        nft add rule inet "${TABLE}" output ct state established,related accept
+        echo "${PROG}: network disabled" >&2
+        ;;
+    status)
+        if nft list table inet "${TABLE}" &>/dev/null; then
+            echo "disabled"
+        else
+            echo "enabled"
+        fi
+        ;;
+    -h|--help)
+        cat <<EOF
+Usage: ${PROG} {enable|disable|status}
+
+Toggle outbound network access via nftables.
+
+  enable    remove drop rules; all outbound traffic allowed
+  disable   add drop rules; new outbound connections blocked
+  status    print current state (enabled or disabled)
+  -h, --help     display this help and exit
+  -V, --version  output version information and exit
+EOF
+        exit 0
+        ;;
+    -V|--version)
+        echo "${PROG} ${VERSION}"
+        exit 0
+        ;;
+    *)
+        echo "Usage: ${PROG} {enable|disable|status}" >&2
+        exit 2
+        ;;
+esac
+NETSCRIPT
+
+    echo "fedora-sandbox: installing development tools and sandbox-net into base image..." >&2
     virt-customize -a "${BASE_IMAGE}" \
-        --install gcc,gcc-c++,glibc-devel,make,binutils,python3,openssl-devel,libcurl-devel,zlib-devel,ncurses-devel,zip,unzip,unar \
+        --install gcc,gcc-c++,glibc-devel,make,binutils,python3,openssl-devel,libcurl-devel,zlib-devel,ncurses-devel,zip,unzip,unar,nftables,git,gawk,sed,wget \
+        --upload "${net_script}:/usr/local/bin/sandbox-net" \
+        --chmod "0755:/usr/local/bin/sandbox-net" \
         --selinux-relabel
-    echo "fedora-sandbox: development tools installed" >&2
+    echo "fedora-sandbox: base image prepared" >&2
 
     if [[ -f "${LAX_IMAGE}" ]]; then
         echo "fedora-sandbox: base image updated — removing stale lax overlay" >&2
         rm -f "${LAX_IMAGE}"
     fi
-    rm -f "${SEED_ISO}"
+    rm -f "${SANDBOX_SEED}" "${LAX_SEED}"
 
     echo "fedora-sandbox: base image saved to ${BASE_IMAGE}" >&2
 }
@@ -194,35 +330,37 @@ launch_vm() {
     command -v qemu-img           &>/dev/null || { echo "fedora-sandbox: qemu-img not found" >&2;            exit 1; }
 
     [[ -f "${BASE_IMAGE}" ]] || { echo "fedora-sandbox: no base image found — run: $(basename "$0") --update-image" >&2; exit 1; }
-    [[ -f "${SEED_ISO}" ]]   || create_seed_iso
 
-    local overlay network_args
+    local overlay seed_iso
 
     if [[ "${MODE}" == "sandbox" ]]; then
+        seed_iso="${SANDBOX_SEED}"
+        [[ -f "${seed_iso}" ]] || create_seed_iso "${seed_iso}" sandbox
         overlay=$(mktemp "${STORE_DIR}/sandbox-XXXXXX.qcow2")
         rm -f "${overlay}"
         qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE}" "${overlay}"
-        network_args="-nic none"
         # shellcheck disable=SC2064
         trap "rm -f ${overlay}" EXIT
-        echo "mode : FULL SANDBOX — no network, disposable" >&2
-        echo "note : cloud-init network detection may add ~60s to first boot" >&2
+        echo "mode : SANDBOX — network disabled at boot, disposable" >&2
     else
+        seed_iso="${LAX_SEED}"
+        [[ -f "${seed_iso}" ]] || create_seed_iso "${seed_iso}" lax
         if ${DO_RESET} && [[ -f "${LAX_IMAGE}" ]]; then
             echo "fedora-sandbox: resetting lax overlay..." >&2
             rm -f "${LAX_IMAGE}"
         fi
         overlay="${LAX_IMAGE}"
-        network_args="-nic user,model=virtio"
         if [[ ! -f "${overlay}" ]]; then
             qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE}" "${overlay}"
         fi
-        echo "mode : LAX — NAT network, persistent overlay" >&2
+        echo "mode : LAX — network enabled, persistent overlay" >&2
         echo "disk : ${overlay}" >&2
     fi
 
     echo "" >&2
-    echo "login : fedora / sandbox" >&2
+    echo "login : fedora / sandbox  (auto-login on console)" >&2
+    echo "ssh   : ssh -p ${SSH_PORT} fedora@localhost" >&2
+    echo "scp   : scp -P ${SSH_PORT} <file> fedora@localhost:~" >&2
     echo "exit  : Ctrl-A X" >&2
     echo "" >&2
 
@@ -231,8 +369,8 @@ launch_vm() {
         -m "${VM_RAM}" \
         -smp "${VM_CPUS}" \
         -drive file="${overlay}",format=qcow2,if=virtio \
-        -drive file="${SEED_ISO}",format=raw,if=virtio,readonly=on \
-        ${network_args} \
+        -drive file="${seed_iso}",format=raw,if=virtio,readonly=on \
+        -nic user,model=virtio,hostfwd=tcp::${SSH_PORT}-:22 \
         -nographic \
         -serial mon:stdio
 }
