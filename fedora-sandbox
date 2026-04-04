@@ -7,15 +7,26 @@ if [[ -f /run/.containerenv ]] || [[ -n "${CONTAINER_ID:-}" ]]; then
 fi
 
 STORE_DIR="${HOME}/.local/share/fedora-sandbox"
-BASE_IMAGE="${STORE_DIR}/base.qcow2"
-LAX_IMAGE="${STORE_DIR}/lax.qcow2"
-SANDBOX_SEED="${STORE_DIR}/sandbox-seed.iso"
-LAX_SEED="${STORE_DIR}/lax-seed.iso"
+SEED_ISO="${STORE_DIR}/seed.iso"
 
 # Support both old (SANDBOX_*) and new (FEDORA_SANDBOX_*) env var names
 VM_CPUS="${FEDORA_SANDBOX_CPUS:-${SANDBOX_CPUS:-2}}"
 VM_RAM="${FEDORA_SANDBOX_RAM:-${SANDBOX_RAM:-2G}}"
 SSH_PORT=2222
+
+VM_ARCH="${FEDORA_SANDBOX_ARCH:-$(uname -m)}"
+case "${VM_ARCH}" in
+    x86_64|aarch64) ;;
+    *) echo "fedora-sandbox: unsupported architecture: ${VM_ARCH}" >&2; exit 1 ;;
+esac
+
+case "${VM_ARCH}" in
+    x86_64)  QEMU_BIN="qemu-system-x86_64" ;;
+    aarch64) QEMU_BIN="qemu-system-aarch64" ;;
+esac
+
+BASE_IMAGE="${STORE_DIR}/base-${VM_ARCH}.qcow2"
+LAX_IMAGE="${STORE_DIR}/lax-${VM_ARCH}.qcow2"
 
 VERSION="1.0"
 MODE="sandbox"
@@ -26,11 +37,10 @@ EXPLICIT_LAUNCH=false
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTION]...
-
 Create and launch a disposable or persistent Fedora Cloud VM via QEMU/KVM.
 
   --sandbox         full sandbox: network disabled at boot, disposable VM (default)
-  --lax             network enabled at boot, persistent disk
+  --lax             network disabled at boot, persistent disk; enable with sandbox-net
   --reset           with --lax: wipe persistent overlay and start fresh
   --update-image    download latest Fedora Cloud image and remove stale
                     overlays; exit unless --sandbox or --lax is also passed
@@ -40,6 +50,7 @@ Create and launch a disposable or persistent Fedora Cloud VM via QEMU/KVM.
 Environment:
   FEDORA_SANDBOX_CPUS    vCPU count (default: 2)
   FEDORA_SANDBOX_RAM     RAM allocation (default: 2G)
+  FEDORA_SANDBOX_ARCH    VM architecture (default: host arch)
 
 SSH access (both modes): ssh -p ${SSH_PORT} fedora@localhost  (password: sandbox)
 Network control (in VM): sudo sandbox-net {enable|disable|status}
@@ -80,10 +91,7 @@ mkdir -p "${STORE_DIR}"
 # cloud-init seed ISO — provides login credentials and first-boot config
 # ---------------------------------------------------------------------------
 create_seed_iso() {
-    local dest="$1"
-    local mode="$2"
-
-    echo "fedora-sandbox: creating ${mode} cloud-init seed ISO..." >&2
+    echo "fedora-sandbox: creating cloud-init seed ISO..." >&2
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -95,8 +103,7 @@ instance-id: fedora-sandbox
 local-hostname: sandbox
 EOF
 
-    if [[ "${mode}" == "sandbox" ]]; then
-        cat > "${tmpdir}/user-data" <<'EOF'
+    cat > "${tmpdir}/user-data" <<'EOF'
 #cloud-config
 users:
   - name: fedora
@@ -115,10 +122,6 @@ write_files:
   - path: /etc/motd
     permissions: '0644'
     content: |
-      ┌─ SANDBOX MODE ──────────────────────────────────┐
-      │  Network is DISABLED. Outbound traffic blocked.  │
-      └──────────────────────────────────────────────────┘
-
       Network control:
         sudo sandbox-net enable   — allow outbound traffic
         sudo sandbox-net disable  — block outbound traffic
@@ -133,51 +136,13 @@ runcmd:
   - /usr/local/bin/sandbox-net disable
   - systemctl disable --now cloud-init cloud-init-local cloud-config cloud-final 2>/dev/null || true
 EOF
-    else
-        cat > "${tmpdir}/user-data" <<'EOF'
-#cloud-config
-users:
-  - name: fedora
-    plain_text_passwd: sandbox
-    lock_passwd: false
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-ssh_pwauth: true
-write_files:
-  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
-    permissions: '0644'
-    content: |
-      [Service]
-      ExecStart=
-      ExecStart=-/sbin/agetty --autologin fedora --keep-baud 115200,57600,38400,9600 %I $TERM
-  - path: /etc/motd
-    permissions: '0644'
-    content: |
-      ┌─ LAX MODE ─────────────────────────────────────┐
-      │  Network is ENABLED. NAT via QEMU user-mode.   │
-      └─────────────────────────────────────────────────┘
-
-      Network control:
-        sudo sandbox-net enable   — allow outbound traffic
-        sudo sandbox-net disable  — block outbound traffic
-        sudo sandbox-net status   — show current state
-
-      File transfer (from host):
-        scp -P 2222 <file> fedora@localhost:~
-
-runcmd:
-  - systemctl daemon-reload
-  - systemctl restart serial-getty@ttyS0.service
-  - systemctl disable --now cloud-init cloud-init-local cloud-config cloud-final 2>/dev/null || true
-EOF
-    fi
 
     if command -v xorriso &>/dev/null; then
-        xorriso -as mkisofs -output "${dest}" \
+        xorriso -as mkisofs -output "${SEED_ISO}" \
             -volid cidata -joliet -rock \
             "${tmpdir}/user-data" "${tmpdir}/meta-data" 2>/dev/null
     elif command -v genisoimage &>/dev/null; then
-        genisoimage -output "${dest}" \
+        genisoimage -output "${SEED_ISO}" \
             -volid cidata -joliet -rock \
             "${tmpdir}/user-data" "${tmpdir}/meta-data"
     else
@@ -195,6 +160,11 @@ update_image() {
     command -v curl      &>/dev/null || { echo "fedora-sandbox: curl is required" >&2;      exit 1; }
     command -v sha256sum &>/dev/null || { echo "fedora-sandbox: sha256sum is required" >&2; exit 1; }
 
+    local net_script
+    net_script=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '${BASE_IMAGE}.tmp' '${net_script}'" RETURN
+
     local releases_url="https://dl.fedoraproject.org/pub/fedora/linux/releases/"
 
     echo "fedora-sandbox: fetching latest Fedora Cloud release..." >&2
@@ -205,7 +175,7 @@ update_image() {
     [[ -n "${latest_version}" ]] || { echo "fedora-sandbox: could not determine latest Fedora version" >&2; exit 1; }
     echo "fedora-sandbox: latest version: Fedora ${latest_version}" >&2
 
-    local images_url="${releases_url}${latest_version}/Cloud/x86_64/images/"
+    local images_url="${releases_url}${latest_version}/Cloud/${VM_ARCH}/images/"
     local image_filename
     image_filename=$(curl -s "${images_url}" \
         | grep -oP 'Fedora-Cloud-Base-Generic[^"]+\.qcow2' \
@@ -245,10 +215,6 @@ update_image() {
     mv "${BASE_IMAGE}.tmp" "${BASE_IMAGE}"
 
     # Write sandbox-net to a tempfile for upload into the image
-    local net_script
-    net_script=$(mktemp)
-    # shellcheck disable=SC2064
-    trap "rm -f ${net_script}" RETURN
     cat > "${net_script}" <<'NETSCRIPT'
 #!/bin/bash
 # sandbox-net — toggle outbound network access inside the sandbox VM
@@ -286,11 +252,13 @@ Usage: ${PROG} {enable|disable|status}
 
 Toggle outbound network access via nftables.
 
-  enable    remove drop rules; all outbound traffic allowed
-  disable   add drop rules; new outbound connections blocked
-  status    print current state (enabled or disabled)
-  -h, --help     display this help and exit
-  -V, --version  output version information and exit
+  enable           remove drop rules; all outbound traffic allowed
+  disable          add drop rules; new outbound connections blocked
+  status           print current state (enabled or disabled)
+  -h, --help       display this help and exit
+  -V, --version    output version information and exit
+
+Report bugs to: https://github.com/agiacalone/qemu-lab/issues
 EOF
         exit 0
         ;;
@@ -317,7 +285,7 @@ NETSCRIPT
         echo "fedora-sandbox: base image updated — removing stale lax overlay" >&2
         rm -f "${LAX_IMAGE}"
     fi
-    rm -f "${SANDBOX_SEED}" "${LAX_SEED}"
+    rm -f "${SEED_ISO}"
 
     echo "fedora-sandbox: base image saved to ${BASE_IMAGE}" >&2
 }
@@ -326,25 +294,22 @@ NETSCRIPT
 # Launch the VM
 # ---------------------------------------------------------------------------
 launch_vm() {
-    command -v qemu-system-x86_64 &>/dev/null || { echo "fedora-sandbox: qemu-system-x86_64 not found" >&2; exit 1; }
-    command -v qemu-img           &>/dev/null || { echo "fedora-sandbox: qemu-img not found" >&2;            exit 1; }
+    command -v "${QEMU_BIN}" &>/dev/null || { echo "fedora-sandbox: ${QEMU_BIN} not found" >&2; exit 1; }
+    command -v qemu-img      &>/dev/null || { echo "fedora-sandbox: qemu-img not found" >&2;  exit 1; }
 
     [[ -f "${BASE_IMAGE}" ]] || { echo "fedora-sandbox: no base image found — run: $(basename "$0") --update-image" >&2; exit 1; }
+    [[ -f "${SEED_ISO}" ]]   || create_seed_iso
 
-    local overlay seed_iso
+    local overlay
 
     if [[ "${MODE}" == "sandbox" ]]; then
-        seed_iso="${SANDBOX_SEED}"
-        [[ -f "${seed_iso}" ]] || create_seed_iso "${seed_iso}" sandbox
         overlay=$(mktemp "${STORE_DIR}/sandbox-XXXXXX.qcow2")
         rm -f "${overlay}"
         qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE}" "${overlay}"
         # shellcheck disable=SC2064
         trap "rm -f ${overlay}" EXIT
-        echo "mode : SANDBOX — network disabled at boot, disposable" >&2
+        echo "mode : SANDBOX — network disabled, disposable" >&2
     else
-        seed_iso="${LAX_SEED}"
-        [[ -f "${seed_iso}" ]] || create_seed_iso "${seed_iso}" lax
         if ${DO_RESET} && [[ -f "${LAX_IMAGE}" ]]; then
             echo "fedora-sandbox: resetting lax overlay..." >&2
             rm -f "${LAX_IMAGE}"
@@ -353,7 +318,7 @@ launch_vm() {
         if [[ ! -f "${overlay}" ]]; then
             qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE}" "${overlay}"
         fi
-        echo "mode : LAX — network enabled, persistent overlay" >&2
+        echo "mode : LAX — network disabled, persistent overlay" >&2
         echo "disk : ${overlay}" >&2
     fi
 
@@ -364,13 +329,34 @@ launch_vm() {
     echo "exit  : Ctrl-A X" >&2
     echo "" >&2
 
-    qemu-system-x86_64 \
-        -enable-kvm \
+    local qemu_arch_flags=()
+    case "${VM_ARCH}" in
+        x86_64)
+            qemu_arch_flags=(-enable-kvm)
+            ;;
+        aarch64)
+            local efi_bios=""
+            for p in /usr/share/edk2/aarch64/QEMU_EFI.fd \
+                     /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+                     /usr/share/edk2-aarch64/QEMU_EFI.fd; do
+                [[ -f "$p" ]] && { efi_bios="$p"; break; }
+            done
+            qemu_arch_flags=(-machine "virt,accel=kvm" -cpu host)
+            if [[ -n "${efi_bios}" ]]; then
+                qemu_arch_flags+=(-bios "${efi_bios}")
+            else
+                echo "fedora-sandbox: warning: no aarch64 UEFI firmware found; VM may not boot" >&2
+            fi
+            ;;
+    esac
+
+    "${QEMU_BIN}" \
+        "${qemu_arch_flags[@]}" \
         -m "${VM_RAM}" \
         -smp "${VM_CPUS}" \
         -drive file="${overlay}",format=qcow2,if=virtio \
-        -drive file="${seed_iso}",format=raw,if=virtio,readonly=on \
-        -nic user,model=virtio,hostfwd=tcp::${SSH_PORT}-:22 \
+        -drive file="${SEED_ISO}",format=raw,if=virtio,readonly=on \
+        -nic "user,model=virtio,hostfwd=tcp::${SSH_PORT}-:22" \
         -nographic \
         -serial mon:stdio
 }

@@ -35,8 +35,8 @@ KVM provides hardware-level isolation. The guest runs on a virtualized CPU with 
 
 - **Base image**: A Fedora Cloud qcow2 image downloaded from the official Fedora mirrors and SHA256-verified. It is never written to directly. Development tools and the `sandbox-net` script are baked in at update time.
 - **Overlay images**: Each session (sandbox or lax) uses a qcow2 overlay backed by the base image. All writes go to the overlay. In sandbox mode, the overlay is deleted on exit.
-- **Cloud-init seeding**: A NoCloud seed ISO per mode provides credentials, autologin, and first-boot configuration without requiring a network-accessible metadata server.
-- **Network control**: Both modes expose a NAT NIC with SSH port forwarding. In sandbox mode, outbound traffic is blocked at boot via `nftables` using the `sandbox-net` script baked into the image. The instructor can enable network temporarily (e.g. to copy files) and re-disable it before running student code.
+- **Cloud-init seeding**: A single NoCloud seed ISO provides credentials, autologin, and first-boot configuration without requiring a network-accessible metadata server.
+- **Network control**: Both modes expose a NAT NIC with SSH port forwarding. Both modes start with outbound traffic blocked at boot via `nftables` using the `sandbox-net` script baked into the image. Enable network manually with `sudo sandbox-net enable`.
 - **Distrobox awareness**: If the script is invoked from inside a Distrobox container, it automatically re-execs itself on the host via `distrobox-host-exec`. QEMU and KVM run on the Fedora Kinoite host, not inside a container.
 
 ---
@@ -45,12 +45,12 @@ KVM provides hardware-level isolation. The guest runs on a virtualized CPU with 
 
 | Mode | Command | Network | Disk | Use case |
 |------|---------|---------|------|----------|
-| Sandbox (default) | `fedora-sandbox` | Disabled at boot (re-enable with `sudo sandbox-net enable`) | Disposable overlay, deleted on exit | Grading untrusted submissions |
-| Lax | `fedora-sandbox --lax` | Enabled at boot | Persistent overlay at `~/.local/share/fedora-sandbox/lax.qcow2` | Testing with network access, keeping state between sessions |
-| Lax reset | `fedora-sandbox --lax --reset` | Enabled | Wipes and recreates lax overlay | Starting fresh from the base image |
+| Sandbox (default) | `fedora-sandbox` | Disabled at boot | Disposable overlay, deleted on exit | Grading untrusted submissions |
+| Lax | `fedora-sandbox --lax` | Disabled at boot; enable with `sudo sandbox-net enable` | Persistent overlay at `~/.local/share/fedora-sandbox/lax.qcow2` | Development with persistent state |
+| Lax reset | `fedora-sandbox --lax --reset` | Disabled at boot; enable with `sudo sandbox-net enable` | Wipes and recreates lax overlay | Starting fresh from the base image |
 | Update image | `fedora-sandbox --update-image` | — | Downloads latest Fedora Cloud image | Keeping the base image current |
 
-In sandbox mode the VM has a NAT NIC, but `sandbox-net disable` runs at first boot and drops all new outbound connections via an nftables output chain. Established connections (including any open SSH session) are not affected, so you can copy files in with `scp` even while the network is nominally disabled.
+Both modes have a NAT NIC, but `sandbox-net disable` runs at first boot and drops all new outbound connections via an nftables output chain. Established connections (including any open SSH session) are not affected, so you can copy files in with `scp` even while the network is nominally disabled.
 
 ---
 
@@ -140,8 +140,7 @@ All runtime files are stored under `~/.local/share/fedora-sandbox/`:
 ~/.local/share/fedora-sandbox/
 ├── base.qcow2              # Fedora Cloud base image (never modified directly)
 ├── lax.qcow2               # Persistent lax overlay (backed by base.qcow2)
-├── sandbox-seed.iso        # Cloud-init seed ISO for sandbox mode
-├── lax-seed.iso            # Cloud-init seed ISO for lax mode
+├── seed.iso                # Cloud-init NoCloud seed ISO (shared by both modes)
 └── sandbox-XXXXXX.qcow2   # Disposable sandbox overlay (deleted on VM exit)
 ```
 
@@ -153,7 +152,7 @@ After running `--update-image`, any existing `lax.qcow2`, `sandbox-seed.iso`, an
 
 ## Security Notes
 
-- Network isolation in sandbox mode is enforced inside the VM via `nftables` (the `sandbox-net` script), not at the QEMU level. The VM has a NAT NIC for SSH/scp access; outbound traffic from student code is blocked by an nftables output chain that drops new connections while allowing established ones.
+- Network isolation is enforced inside the VM via `nftables` (the `sandbox-net` script), not at the QEMU level. Both modes start with outbound traffic blocked; the NAT NIC is used for SSH/scp access only.
 - The base image is SHA256-verified against the official Fedora checksum file on every download.
 - Cloud-init is disabled inside the VM after first boot to prevent re-initialization.
 - The guest login password is intentionally weak (`sandbox`). The VM is behind QEMU user-mode NAT and is only reachable via the forwarded SSH port on localhost; the password exists for console and SSH convenience, not security.
